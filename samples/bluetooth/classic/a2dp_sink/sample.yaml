@@ -1,0 +1,29 @@
+sample:
+  name: "Classic Bluetooth A2DP Sink with AVRCP Target"  
+  description: >
+    This sample implements a Classic Bluetooth (BR/EDR) A2DP Sink device with 
+    AVRCP Target support. It receives stereo audio from a Bluetooth Controller 
+    (e.g., smartphone) via A2DP and responds to basic AVRCP commands (play/pause/stop, 
+    volume up/down). BLE is disabled, only Classic Bluetooth is used for device discovery 
+    and data transmission.
+  categories:  
+    - bluetooth
+    - audio
+  tags:
+    - a2dp
+    - avrcp
+    - classic_bt
+    - audio_sink
+  supported:  
+    - sf32lb52_devkit_lcd  
+  depends_on:
+    - bluetooth
+    - bluetooth_bredr
+    - bluetooth_a2dp
+    - bluetooth_avrcp
+    - audio
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Classic A2DP\\+AVRCP Sink ready. Waiting for phone connection..."
