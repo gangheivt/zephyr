@@ -11,12 +11,14 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/kernel.h>
+#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S)
 #include <zephyr/drivers/i2s.h>
+#endif
 #include <zephyr/audio/codec.h>
 #include "audio_buf.h"
 #include "codec_play.h"
 
-#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S) && IS_ENABLED(CONFIG_AUDIO_CODEC)
+#if IS_ENABLED(CONFIG_AUDIO_CODEC)
 
 #if CONFIG_NOCACHE_MEMORY
 #define __NOCACHE	__attribute__((__section__(".nocache")))
@@ -29,29 +31,46 @@
 /* audio stream control variables */
 static volatile bool audio_start;
 static uint32_t audio_sample_rate;
+static uint32_t audio_sample_channel_num;
 static uint8_t *audio_data_sync_buf[CONFIG_A2DP_BOARD_CODEC_PLAY_COUNT];
 static uint32_t audio_data_sync_buf_size[CONFIG_A2DP_BOARD_CODEC_PLAY_COUNT];
 static uint8_t audio_data_sync_buf_w;
 static uint8_t audio_data_sync_buf_r;
 static __NOCACHE __aligned(4) uint8_t a2dp_silence_data[A2DP_SBC_DATA_PLAY_SIZE_48K];
+
+#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S)
 #define I2S_CODEC_TX DT_ALIAS(i2s_codec_tx)
 #define I2S_TIMEOUT (2000U)
-
 const struct device *const codec_tx = DEVICE_DT_GET(I2S_CODEC_TX);
-
 static __NOCACHE __aligned(4) uint8_t mem_slab_buffer[CONFIG_A2DP_BOARD_CODEC_PLAY_COUNT *
 						      A2DP_SBC_DATA_PLAY_SIZE_48K];
 static struct k_mem_slab mem_slab;
+#elif DT_HAS_ALIAS(codec0)
+const struct device *const codec_tx = DEVICE_DT_GET(DT_ALIAS(codec0));
+struct k_sem tx_done_sem;
+
+static void tx_done(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(dev);	
+	ARG_UNUSED(user_data);
+	k_sem_give(&tx_done_sem);
+}
+#else
+#error	"Unsupported codec device, please check your board overlay and Kconfig"
+#endif
 
 int codec_play_init(void)
 {
+#if DT_HAS_ALIAS(i2s_codec_tx) 
 	const struct device *const codec_dev = DEVICE_DT_GET(DT_NODELABEL(audio_codec));
-
 	if (!device_is_ready(codec_tx)) {
 		printk("%s is not ready\n", codec_tx->name);
 		return -EIO;
 	}
-
+#elif DT_HAS_ALIAS(codec0)
+	const struct device *const codec_dev = DEVICE_DT_GET(DT_ALIAS(codec0));
+	k_sem_init(&tx_done_sem, 0, 1);
+#endif
 	if (!device_is_ready(codec_dev)) {
 		printk("%s is not ready\n", codec_dev->name);
 		return -EIO;
@@ -60,19 +79,12 @@ int codec_play_init(void)
 	return 0;
 }
 
-void codec_play_configure(uint32_t sample_rate, uint8_t sample_width, uint8_t channels)
+static void codec_play_configure_audio (uint32_t sample_rate, uint8_t sample_width, uint8_t channels, size_t block_size)
 {
-	const struct device *const codec_dev = DEVICE_DT_GET(DT_NODELABEL(audio_codec));
-	struct i2s_config config;
 	struct audio_codec_cfg audio_cfg;
-	size_t block_size;
 
-	audio_sample_rate = sample_rate;
-	if (sample_rate == 44100) {
-		block_size = A2DP_SBC_DATA_PLAY_SIZE_44_1K;
-	} else {
-		block_size = A2DP_SBC_DATA_PLAY_SIZE_48K;
-	}
+#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S)	
+	const struct device *const codec_dev = DEVICE_DT_GET(DT_NODELABEL(audio_codec));
 
 	audio_cfg.dai_route = AUDIO_ROUTE_PLAYBACK;
 	audio_cfg.dai_type = AUDIO_DAI_TYPE_I2S;
@@ -87,8 +99,34 @@ void codec_play_configure(uint32_t sample_rate, uint8_t sample_width, uint8_t ch
 	audio_cfg.dai_cfg.i2s.frame_clk_freq = sample_rate;
 	audio_cfg.dai_cfg.i2s.mem_slab = &mem_slab;
 	audio_cfg.dai_cfg.i2s.block_size = block_size;
+#elif DT_HAS_ALIAS(codec0) 
+	const struct device *const codec_dev = codec_tx;
+
+	audio_codec_register_done_callback(codec_dev, tx_done, NULL, NULL, NULL);
+	audio_cfg.dai_type = AUDIO_DAI_TYPE_PCM;
+	audio_cfg.dai_cfg.pcm.dir = AUDIO_DAI_DIR_TX;
+	audio_cfg.dai_cfg.pcm.pcm_width = sample_width;
+	audio_cfg.dai_cfg.pcm.channels = 1U; /* Convert to mono channel for codec without enough channel support. */
+	if (channels == 2U) {
+		block_size/= 2U;
+	}
+	audio_cfg.dai_cfg.pcm.block_size = block_size;
+	audio_cfg.dai_cfg.pcm.samplerate = sample_rate;
+#endif
 	audio_codec_configure(codec_dev, &audio_cfg);
-	k_msleep(1000);
+	k_msleep(1000);	
+}
+
+void codec_play_configure(uint32_t sample_rate, uint8_t sample_width, uint8_t channels)
+{
+	size_t block_size = (sample_rate == 44100) ? A2DP_SBC_DATA_PLAY_SIZE_44_1K : A2DP_SBC_DATA_PLAY_SIZE_48K;
+
+	audio_sample_rate = sample_rate;
+	audio_sample_channel_num = channels;
+	codec_play_configure_audio(sample_rate, sample_width, channels, block_size);
+
+#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S)	
+	struct i2s_config config;
 
 	config.word_size = sample_width;
 	config.channels = channels;
@@ -107,16 +145,36 @@ void codec_play_configure(uint32_t sample_rate, uint8_t sample_width, uint8_t ch
 	}
 
 	k_mem_slab_init(&mem_slab, mem_slab_buffer, block_size, CONFIG_A2DP_BOARD_CODEC_PLAY_COUNT);
+#endif	
 }
 
 static void codec_play_to_dev(uint8_t *data, uint32_t length)
 {
 	int ret;
 
+#if DT_HAS_ALIAS(i2s_codec_tx) && IS_ENABLED(CONFIG_I2S)
 	ret = i2s_buf_write(codec_tx, data, length);
 	if (ret < 0) {
 		printk("Failed to write data: %d\n", ret);
 	}
+
+#elif DT_HAS_ALIAS(codec0)
+	/*Convert to mono channel and play*/
+	if (audio_sample_channel_num == 2) {
+		static int16_t mono_buf[A2DP_SBC_DATA_PLAY_SIZE_48K/2];
+		for (uint32_t i = 0; i < length / 2; i++) {
+			int16_t sample = ((int16_t *)data)[i * 2] / 2 + ((int16_t *)data)[i * 2 + 1] / 2;
+			mono_buf[i] = sample;
+		}
+		data = (uint8_t *)mono_buf;
+		length /= 2;
+	}	
+	ret = audio_codec_write(codec_tx, data, length);
+	if (ret < 0) {
+		printk("Failed to write data: %d\n", ret);
+	}
+	k_sem_take(&tx_done_sem, K_FOREVER);
+#endif	
 }
 
 static void codec_play_data(uint8_t *data, uint32_t length)
@@ -144,9 +202,10 @@ void codec_play_start(void)
 	if (audio_start) {
 		return;
 	}
-
 	audio_start = true;
-
+#if DT_HAS_ALIAS(codec0) 
+	audio_codec_start(codec_tx, AUDIO_DAI_DIR_TX);
+#else	
 	for (uint8_t i = 0; i < CONFIG_A2DP_BOARD_CODEC_PLAY_COUNT; i++) {
 		codec_play_data(a2dp_silence_data,
 				audio_sample_rate == 48000 ?
@@ -156,6 +215,7 @@ void codec_play_start(void)
 			i2s_trigger(codec_tx, I2S_DIR_TX, I2S_TRIGGER_START);
 		}
 	}
+#endif	
 }
 
 void codec_play_stop(void)
@@ -163,7 +223,6 @@ void codec_play_stop(void)
 	if (!audio_start) {
 		return;
 	}
-
 	audio_start = false;
 	/* Don't need to stop codec_tx. After all the written buf is sent, the I2S tx is stopped. */
 	/* i2s_trigger(codec_tx, I2S_DIR_TX, I2S_TRIGGER_STOP); */
